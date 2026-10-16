@@ -29,13 +29,18 @@ class Battery(Cell):
 
     def available_power(self) -> float:
         """Max electrical power (W) the pack can deliver at this SOC/temperature."""
+        # if the battery is out of charge then return 0
         if self._soc <= 0.0:
             return 0.0
-        return (
-            self._series
-            * self._cell_v
-            * (self._parallel * self.cell_curr_limits(self._i, self._dt))
+        
+        power = (
+            self._series # number of cells wired in series (?)
+            * self._cell_v # voltage of a single cell under load
+            * (self._parallel * self.cell_curr_limits(self._i, self._dt)) 
+            # ^ cells in parallel * max current a single cell can discharge
         )
+        
+        return min(power, 80e3)
 
     def available_energy(self) -> float:
         return self._parallel * self._series * self._cell_v * self._q_nom / 3600 * self._soc / 1000
@@ -87,7 +92,8 @@ class StaticVoltageBattery:
     max_power: float = float("inf")
 
     def available_power(self) -> float:
-        return self.max_power
+        
+        return min(self.max_power, 80e3)
 
     @property
     def voltage(self) -> float:

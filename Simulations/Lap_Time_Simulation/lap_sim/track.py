@@ -281,7 +281,7 @@ _ENDUR_CURVATURE_RAW = np.array(
         0,
         1 / 3,
     ]
-)
+) 
 
 # The original scales the endurance layout so its total lap length is exactly 1000 m,
 # scaling curvature by the inverse factor so physical corner radii are preserved.

@@ -27,6 +27,107 @@ GRAVITY = 9.806  # m/s^2, matches the original scripts' constant
 MAX_WEIGHT_TRANSFER = 0.9  # cap on the linear load-transfer fraction below (see force_balance)
 
 
+
+# helper function to calculate electrical power for a give tractive acceleration
+# same equations as power_and_energy() function
+def electrical_power_for_tractive_accel(
+    v,
+    tractive_accel,
+    mass,
+    tire,
+    ratio,
+    drivetrain_efficiency,
+    motor_efficiency_fn,
+):
+    """Electrical input power required for a given tractive acceleration.
+
+    tractive_accel is wheel tractive force divided by mass.
+    It is NOT net vehicle acceleration after aerodynamic drag.
+    """
+
+    if v <= 0.0 or tractive_accel <= 0.0:
+        return 0.0
+
+    f_traction = mass * tractive_accel
+
+    omega = v / tire.radius * ratio
+    torque = (
+        f_traction * tire.radius
+        / ratio
+        / drivetrain_efficiency
+    )
+
+    eta_motor = float(motor_efficiency_fn(omega, torque))
+
+    if not np.isfinite(eta_motor) or eta_motor <= 0.0:
+        raise ValueError(
+            f"Invalid motor efficiency: {eta_motor}"
+        )
+
+    p_wheel = f_traction * v
+
+    return p_wheel / drivetrain_efficiency / eta_motor
+
+
+# we can calculate power from acceleration but not really the other way round
+# best sol. is to use binary search to find the best acceleration that fits the 80kw limit
+
+def limit_tractive_accel_by_electrical_power(
+    v,
+    tractive_accel_max,
+    max_electrical_power,
+    mass,
+    tire,
+    ratio,
+    drivetrain_efficiency,
+    motor_efficiency_fn,
+):
+    if tractive_accel_max <= 0.0 or v <= 0.0:
+        return max(0.0, tractive_accel_max)
+
+    if not np.isfinite(max_electrical_power):
+        return tractive_accel_max
+
+    # Check whether the original maximum acceleration already satisfies
+    # the electrical power limit. Avoid binary search if it does.
+    p_max = electrical_power_for_tractive_accel(
+        v,
+        tractive_accel_max,
+        mass,
+        tire,
+        ratio,
+        drivetrain_efficiency,
+        motor_efficiency_fn,
+    )
+
+    if p_max <= max_electrical_power:
+        return tractive_accel_max
+
+    lo = 0.0
+    hi = tractive_accel_max
+
+    # 30 iterations are sufficient for a precise acceleration bound.
+    for _ in range(30):
+        mid = 0.5 * (lo + hi)
+
+        p_mid = electrical_power_for_tractive_accel(
+            v,
+            mid,
+            mass,
+            tire,
+            ratio,
+            drivetrain_efficiency,
+            motor_efficiency_fn,
+        )
+
+        if p_mid <= max_electrical_power:
+            lo = mid
+        else:
+            hi = mid
+
+    return lo
+
+
 def force_balance(
     v,
     k,
@@ -46,6 +147,8 @@ def force_balance(
     battery,
     t: float = None,
     battery_power_override: float = None,
+    motor_efficiency_fn=None,
+    max_electrical_power=None,
 ):
     """Longitudinal brake/accel limits (m/s^2) at speed `v` and curvature `k`.
 
@@ -67,12 +170,34 @@ def force_balance(
 
     power_limited_accel = power_limit / mass / v if v > 0.0 else np.inf
 
-    if battery is None:
-        battery_limited_accel = np.inf
-    elif battery_power_override is not None:
-        battery_limited_accel = battery_power_override / mass / v if v > 0.0 else np.inf
-    else:
-        battery_limited_accel = battery.available_power() / mass / v if v > 0.0 else np.inf
+
+
+    # if battery is None:
+    #     battery_limited_accel = np.inf
+    # elif battery_power_override is not None:
+    #     battery_limited_accel = battery_power_override / mass / v if v > 0.0 else np.inf
+    # else:
+    #     battery_limited_accel = battery.available_power() / mass / v if v > 0.0 else np.inf
+
+
+    # replaced above with below
+    # assuming battery.available_power() and battery_power_override are in watts
+
+    battery_power_limit = np.inf if battery is None else battery.available_power()
+
+    if battery_power_override is not None:
+        battery_power_limit = min(
+            battery_power_limit,
+            max(0.0, battery_power_override),
+        )
+
+    electrical_power_limit = battery_power_limit
+    if max_electrical_power is not None:
+        electrical_power_limit = min(
+            electrical_power_limit,
+            max_electrical_power,
+        )
+
 
     # Linear load-transfer model -- only valid up to "all the load has transferred to
     # one axle" (weight_transfer -> 1). At high enough potential_fx (e.g. a lot of
@@ -88,13 +213,41 @@ def force_balance(
     max_torque = np.interp(omega, motor_w, motor_m)
     motor_limited_accel = max_torque * count * ratio * efficiency / tire.radius / mass
 
+    # accel_limit = min(
+    #     power_limited_accel, traction_limited_accel, motor_limited_accel, battery_limited_accel
+    # )
+    # accel = accel_limit - drag / mass
+    # return brake, accel
+
+    # replaced above with below
+
     accel_limit = min(
-        power_limited_accel, traction_limited_accel, motor_limited_accel, battery_limited_accel
+        power_limited_accel,
+        traction_limited_accel,
+        motor_limited_accel,
     )
+
+    if motor_efficiency_fn is not None:
+        accel_limit = limit_tractive_accel_by_electrical_power(
+            v=v,
+            tractive_accel_max=accel_limit,
+            max_electrical_power=electrical_power_limit,
+            mass=mass,
+            tire=tire,
+            ratio=ratio,
+            drivetrain_efficiency=efficiency,
+            motor_efficiency_fn=motor_efficiency_fn,
+        )
+
     accel = accel_limit - drag / mass
+
     return brake, accel
 
 
+
+
+# instead of simulating thousands of tiny time steps to find the steady-state corner speed, 
+# solve directly for the speed where acceleration reaches zero using a bracketed bisection search.
 def corner_speed_limit(
     k,
     mass,
@@ -114,18 +267,17 @@ def corner_speed_limit(
     time_step=0.001,
     accel_tolerance=0.001 * GRAVITY,
     max_steps=100_000,
+    motor_efficiency_fn=None,
+    max_electrical_power=None,
 ):
-    """Steady-state cornering speed (m/s) for curvature `k`, found by time-marching.
+    """Find steady-state corner speed using a bracketed speed search.
 
-    `v0` seeds the search (0.0 is a cold start); passing an already-known nearby speed
-    lets this converge in a handful of steps instead of climbing all the way from a
-    stop. `max_steps` is a safety net so a non-converging case can't hang.
+    Instead of time-marching in 1 ms increments, find the speed at which
+    the longitudinal acceleration changes from positive to non-positive.
     """
-    v = v0
-    a = accel_tolerance + 1.0  # ensure at least one iteration
-    steps = 0
-    while abs(a) > accel_tolerance and steps < max_steps:
-        _, a = force_balance(
+
+    def acceleration_at(v):
+        _, accel = force_balance(
             v,
             k,
             mass,
@@ -142,10 +294,44 @@ def corner_speed_limit(
             motor.torque_speed_w,
             motor.torque_speed_m,
             battery,
+            motor_efficiency_fn=motor_efficiency_fn,
+            max_electrical_power=max_electrical_power,
         )
-        v = v + a * time_step
-        steps += 1
-    return v
+        return accel
+
+    # If the car cannot accelerate from rest at this curvature,
+    # there is no positive steady-state corner speed.
+    if acceleration_at(0.0) <= 0.0:
+        return 0.0
+
+    # Find an upper speed where acceleration is non-positive.
+    lo = 0.0
+    hi = max(5.0, v0 * 1.2)
+
+    while acceleration_at(hi) > 0.0:
+        hi *= 1.5
+
+        if hi > 200.0:
+            raise RuntimeError(
+                f"Could not bracket corner speed for curvature {k}. "
+                f"Acceleration remains positive at {hi / 1.5:.1f} m/s."
+            )
+
+    # Bisect the speed interval.
+    for _ in range(50):
+        mid = 0.5 * (lo + hi)
+        accel = acceleration_at(mid)
+
+        if accel > 0.0:
+            lo = mid
+        else:
+            hi = mid
+
+        if hi - lo < 1e-3:
+            break
+
+    return 0.5 * (lo + hi)
+
 
 
 def _march(
@@ -171,6 +357,8 @@ def _march(
     motor_w,
     motor_m,
     battery,
+    motor_efficiency_fn=None,
+    max_electrical_power=None,
 ):
     """Forward (accel) or backward (brake) march from `start_idx`, until the profile
     rejoins `limits_snapshot`. Returns a full-length array equal to `limits_snapshot`
@@ -203,6 +391,8 @@ def _march(
             motor_m,
             battery,
             t,
+            motor_efficiency_fn=motor_efficiency_fn,
+            max_electrical_power=max_electrical_power,
         )
         a = accel if direction > 0 else brake
         v_sq = v * v + 2.0 * a * step
@@ -231,6 +421,7 @@ def trace_speed_profile(
     count,
     efficiency,
     motor,
+    max_electrical_power=None,
 ):
     """The feasible speed trace around one lap, battery-blind (no `battery` param at
     all
@@ -273,6 +464,8 @@ def trace_speed_profile(
                 motor.torque_speed_w,
                 motor.torque_speed_m,
                 None,
+                motor_efficiency_fn=motor.efficiency,
+                max_electrical_power=max_electrical_power,
             )
             vv = np.minimum(vv, profile)
         elif point_limit[p] > point_limit[i]:
@@ -299,6 +492,8 @@ def trace_speed_profile(
                 motor.torque_speed_w,
                 motor.torque_speed_m,
                 None,
+                motor_efficiency_fn=motor.efficiency,
+                max_electrical_power=max_electrical_power,
             )
             vv = np.minimum(vv, profile)
     return vv
@@ -322,6 +517,7 @@ def battery_forward_pass(
     motor,
     battery,
     ecms=None,
+    max_electrical_power=None,
 ):
     """Overlay battery-limited acceleration onto an already-resolved, battery-blind
     speed trace `vv_base` (no regen, braking never depends on the battery, so
@@ -384,6 +580,8 @@ def battery_forward_pass(
             motor.torque_speed_m,
             battery,
             battery_power_override=battery_power_override,
+            motor_efficiency_fn=motor.efficiency,
+            max_electrical_power=max_electrical_power,
         )
         v_sq = vv[p] * vv[p] + 2.0 * accel * dx
         v_candidate = np.sqrt(v_sq) if v_sq > 0.0 else 0.0
@@ -407,7 +605,7 @@ def battery_forward_pass(
 
 def step_battery(battery, motor, vv, dx, mass, i, p, cda, air_density, efficiency, tire, ratio):
     dt = dx / vv[i]
-    ax = (vv[i] - vv[p]) / dt
+    ax = (vv[i] ** 2 - vv[p] ** 2) / (2.0 * dx)
     f_drag = 0.5 * cda * air_density * vv[i] ** 2
     f_tract = ax * mass + f_drag
     power = f_tract * vv[i] if f_tract > 0.0 else 0.0
@@ -444,6 +642,9 @@ def power_and_energy(
     Returns a dict of per-point arrays plus lap-average figures. Vectorized (not
     JIT-compiled) since it is a single pass with no sequential dependency.
     """
+
+    # by the time this function is called, the lap is done and were just calculating the 
+    # energy etc required for that
     dt = dx / vv
     tt = np.cumsum(dt)
 
@@ -462,14 +663,35 @@ def power_and_energy(
     pkinetic = -f * vv
     pdrag = -drag * vv
     ft = f + drag
+    # if total force is positive aka car accelerating, then set traction_mask[i] to True
     traction_mask = ft > 0
 
+    # traction mask is bool array of whether the car is accelerating at each point
+
+    # if accelerating then ptraction is total force * vehicle speed
     ptraction = np.where(traction_mask, ft * vv, 0.0)
+
+    # if accelerating then pmotor is ptraction / efficiency ... mechanical power required from the motor
     pmotor = np.where(traction_mask, ptraction / efficiency, 0.0)
+
+    # rotational torque required from electric motor
     tmotor = np.where(traction_mask, ft * tire.radius / ratio / efficiency, 0.0)
+
+    # rotational speed of the motor in radians/second
     wmotor = vv / tire.radius * ratio
+
+    # efficiency of the motor
+    # issue is that this is a lookup map
+    # for pelectric to be limited to 80kw, only vv has to go down, 
+    # but lookup tables cant exactly be inverted like functions
     numotor = motor.efficiency(wmotor, tmotor)
-    pelectric = np.where(traction_mask, pmotor / numotor, 0.0)
+
+    
+    # if it is accelerating then pmotor / numotor calculates electrical power
+    # by dividing motor power by motor efficiency 
+    pelectric = np.where(traction_mask, pmotor / numotor, 0.0) # problem line
+
+    # braking power when car is decelerating WHEN NOT ACCELERATING
     pbrakes = np.where(~traction_mask, ft * vv, 0.0)
 
     batt_energy_usage = (

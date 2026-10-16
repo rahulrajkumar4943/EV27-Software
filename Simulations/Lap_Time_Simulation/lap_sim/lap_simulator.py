@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import numpy as np
 
+import cProfile # profiler
+
 from . import dynamics
 from .regulations import Regulations
 from .results import LapResult, LapStats
 from .track import Track
 from .vehicle import Car
 
+MAX_BATTERY_POWER = 80e3
 
 class LapSimulator:
     """Runs one point-mass lap simulation for a given car/track/ruleset.
@@ -58,6 +61,14 @@ class LapSimulator:
         seg_idx_per_point = track.segment_index(x)
         curvature_by_point = track.curvature[seg_idx_per_point]
 
+        # Apply the regulation's mechanical power limit; the electrical power ceiling
+        # is enforced separately inside force_balance().
+        effective_power_limit = min(
+            regs.power_limit,
+            MAX_BATTERY_POWER * drivetrain.efficiency,
+        )
+
+
         base_args = (
             car.mass,
             car.cg_height_m,
@@ -66,7 +77,8 @@ class LapSimulator:
             car.aero.cla,
             track.air_density,
             car.tire,
-            regs.power_limit,
+            # regs.power_limit, 
+            effective_power_limit,
             drivetrain.ratio,
             float(drivetrain.count),
             drivetrain.efficiency,
@@ -74,23 +86,63 @@ class LapSimulator:
             None,
         )
 
+        # if warm_start is None:
+        #     segment_corner_limit = np.array(
+        #         [dynamics.corner_speed_limit(k, *base_args) for k in track.curvature]
+        #     )
+        # else:
+        #     segment_corner_limit = np.array(
+        #         [
+        #             dynamics.corner_speed_limit(k, *base_args, v0=v0)
+        #             for k, v0 in zip(track.curvature, warm_start)
+        #         ]
+        #     )
+
+        # replaced above with below
+
+
         if warm_start is None:
-            segment_corner_limit = np.array(
-                [dynamics.corner_speed_limit(k, *base_args) for k in track.curvature]
-            )
+            segment_corner_limit = np.array([
+                dynamics.corner_speed_limit(
+                    k,
+                    *base_args,
+                    motor_efficiency_fn=motor.efficiency,
+                    max_electrical_power=MAX_BATTERY_POWER,
+                )
+                for k in track.curvature
+            ])
         else:
-            segment_corner_limit = np.array(
-                [
-                    dynamics.corner_speed_limit(k, *base_args, v0=v0)
-                    for k, v0 in zip(track.curvature, warm_start)
-                ]
-            )
+            segment_corner_limit = np.array([
+                dynamics.corner_speed_limit(
+                    k,
+                    *base_args,
+                    v0=v0,
+                    motor_efficiency_fn=motor.efficiency,
+                    max_electrical_power=MAX_BATTERY_POWER,
+                )
+                for k, v0 in zip(track.curvature, warm_start)
+            ])
+
+
+
         segment_gross_limit = np.minimum(segment_corner_limit, track.limits)
         point_limit = segment_gross_limit[seg_idx_per_point]
 
+        # vv_base = dynamics.trace_speed_profile(
+        #     point_limit, curvature_by_point, seg_idx_per_point, track.limits, dx, *base_args[:-1]
+        # )
+
+        # replaced above with below
+
         vv_base = dynamics.trace_speed_profile(
-            point_limit, curvature_by_point, seg_idx_per_point, track.limits, dx, *base_args[:-1]
-        )
+            point_limit,
+            curvature_by_point,
+            seg_idx_per_point,
+            track.limits,
+            dx,
+            *base_args[:-1],
+            max_electrical_power=MAX_BATTERY_POWER,
+        )       
 
         if car.battery is None:
             vv = vv_base
@@ -107,13 +159,15 @@ class LapSimulator:
                 car.aero.cla,
                 track.air_density,
                 car.tire,
-                regs.power_limit,
+                # regs.power_limit, 
+                effective_power_limit,
                 drivetrain.ratio,
                 float(drivetrain.count),
                 drivetrain.efficiency,
                 motor,
                 car.battery,
                 car.ecms,
+                max_electrical_power=MAX_BATTERY_POWER,
             )
 
         stats_dict = dynamics.power_and_energy(
@@ -168,7 +222,18 @@ class LapSimulator:
         """
         laps = []
         warm_start = None
-        for _ in range(n_laps):
+        for lapnum in range(n_laps):
+            # print(f"[Endurance] Starting lap {lapnum + 1}/{n_laps}")
+
+            # PROFILE FIRST LAP
+            # if lapnum == 0:  # Profile the first lap
+            #     profiler = cProfile.Profile()
+            #     lap = profiler.runcall(self.run, warm_start=warm_start)
+            #     print("\n[Profiler] First-lap hotspots:", flush=True)
+            #     profiler.print_stats(sort="cumtime")
+            # else:
+            #     lap = self.run(warm_start=warm_start)
+
             lap = self.run(warm_start=warm_start)
             warm_start = lap.segment_corner_limit
             laps.append(lap)

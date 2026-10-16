@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass 
 
 import numpy as np
 
@@ -42,6 +42,9 @@ class LapStats:
 
     @classmethod
     def from_dynamics_output(cls, out: dict) -> "LapStats":
+        # LapStats(arguments from out dict...)
+        # **out is like dt=out["dt"], tt=out["tt"], ax=out["ax"], ...
+        # populates a new LapStats object with this data
         return cls(**out)
 
 
