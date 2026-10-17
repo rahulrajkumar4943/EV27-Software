@@ -169,7 +169,7 @@ class LapSimulator:
         laps = []
         warm_start = None
         for lapnum in range(n_laps):
-            print(f"[Endur] lapnum: {lapnum}")
+            # print(f"[Endur] lapnum: {lapnum}")
             lap = self.run(warm_start=warm_start)
             warm_start = lap.segment_corner_limit
             laps.append(lap)
