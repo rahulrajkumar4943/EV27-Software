@@ -6,6 +6,8 @@ the original MATLAB scripts.
 
 from __future__ import annotations
 
+import math
+from bisect import bisect_left
 from dataclasses import dataclass, replace
 from functools import cached_property
 
@@ -39,20 +41,48 @@ class Motor:
         return self.max_torque(omega) * omega
 
     def efficiency(self, omega: np.ndarray, torque: np.ndarray) -> np.ndarray:
-        """Efficiency (0-1) at motor angular speed(s)/torque(s), clamped to the map."""
-        w = np.clip(omega, self.eff_speed[0], self.eff_speed[-1])
-        t = np.clip(torque, self.eff_torque[0], self.eff_torque[-1])
-        return _nearest_2d(self.eff_speed, self.eff_torque, self.eff_map, w, t)
+        """Efficiency (0-1) at motor angular speed(s)/torque(s), clamped to the map.
+
+        Nearest-neighbour lookup: each speed/torque reads the closest grid point. The
+        cell boundaries are the midpoints between grid points (exact ties go to the
+        lower grid point), the same boundaries `max_torque_for_power` inverts, so the
+        two always agree exactly. Values outside the grid read the edge of the map.
+        """
+        speed_mids, torque_mids = self._eff_midpoints
+        ix = np.searchsorted(speed_mids, omega, side="left")
+        iy = np.searchsorted(torque_mids, torque, side="left")
+        result = self.eff_map[ix, iy]
+        return result if np.ndim(omega) or np.ndim(torque) else result.item()
 
     @cached_property
-    def _torque_cell_edges(self) -> np.ndarray:
-        """Torque boundaries of the nearest-neighbour cells in `efficiency`.
+    def _eff_midpoints(self):
+        """Midpoints between neighbouring eff_speed / eff_torque grid points."""
+        s, t = self.eff_speed, self.eff_torque
+        return 0.5 * (s[:-1] + s[1:]), 0.5 * (t[:-1] + t[1:])
 
-        Cell j (nearest grid torque eff_torque[j]) covers (edges[j], edges[j+1]].
-        The outer cells extend to +-inf because `efficiency` clamps torque to the map.
+    @cached_property
+    def _power_inverse_tables(self):
+        """Plain-Python copies of the efficiency map, built once per motor.
+
+        `max_torque_for_power` runs inside the lap sim's innermost loop, and Python
+        floats and lists are several times faster than NumPy for arrays this small.
+
+        speed_mids: speeds halfway between eff_speed grid points. The nearest-neighbour
+            row for a motor speed is found by binary search (bisect) on these.
+        torque_edges: torque cell boundaries. Cell j (nearest grid torque
+            eff_torque[j]) covers (torque_edges[j], torque_edges[j+1]]; the outer cells
+            extend to +-inf because `efficiency` clamps torque to the map.
+        rows: eff_map as a list of lists.
         """
-        mids = 0.5 * (self.eff_torque[:-1] + self.eff_torque[1:])
-        return np.concatenate(([-np.inf], mids, [np.inf]))
+        speed_mids, torque_mids = self._eff_midpoints
+        torque_edges = [-math.inf] + torque_mids.tolist() + [math.inf]
+        # Edges pulled a hair (relative 1e-9) into each cell. `max_torque_for_power`
+        # only returns torques strictly between these, so when the sim recomputes the
+        # torque from the speed trace, round-off (~1e-12 relative) can't push it across
+        # a boundary into a neighbouring cell with a different efficiency.
+        lower_safe = [e + _EDGE_MARGIN * abs(e) if math.isfinite(e) else e for e in torque_edges]
+        upper_safe = [e - _EDGE_MARGIN * abs(e) if math.isfinite(e) else e for e in torque_edges]
+        return speed_mids.tolist(), lower_safe, upper_safe, self.eff_map.tolist()
 
     def max_torque_for_power(self, omega: float, p_elec: float) -> float:
         """Largest torque (Nm) this motor can make at speed `omega` (rad/s) while
@@ -69,30 +99,26 @@ class Motor:
 
         Does not apply the torque-speed envelope; take the min with `max_torque`.
         """
-        if omega <= 0.0 or not np.isfinite(p_elec):
-            return np.inf  # power doesn't constrain torque at standstill
+        if omega <= 0.0 or math.isinf(p_elec):
+            return math.inf  # power doesn't constrain torque at standstill
         if p_elec <= 0.0:
             return 0.0
-        w = min(max(omega, self.eff_speed[0]), self.eff_speed[-1])
-        row = self.eff_map[np.abs(self.eff_speed - w).argmin()]
-        edges = self._torque_cell_edges
-        for j in range(row.shape[0] - 1, -1, -1):
-            t = min(edges[j + 1], p_elec * row[j] / omega)
-            if t > edges[j]:
-                return t
+        speed_mids, lower_safe, upper_safe, rows = self._power_inverse_tables
+        # Nearest speed row by binary search; same boundaries as `efficiency`.
+        row = rows[bisect_left(speed_mids, omega)]
+        x = p_elec / omega
+        for j in range(len(row) - 1, -1, -1):
+            t = x * row[j]
+            if t > lower_safe[j]:
+                return t if t < upper_safe[j + 1] else upper_safe[j + 1]
         return 0.0  # unreachable: the lowest cell extends to -inf
 
     def with_power_limit(self, hard_power_limit: float) -> "Motor":
         return replace(self, hard_power_limit=hard_power_limit)
 
 
-def _nearest_2d(xg: np.ndarray, yg: np.ndarray, z: np.ndarray, x, y):
-    """Nearest-neighbor lookup on a regular (xg, yg) grid; z has shape (len(xg), len(yg))."""
-    ix = np.abs(xg[:, None] - np.atleast_1d(x)[None, :]).argmin(axis=0)
-    iy = np.abs(yg[:, None] - np.atleast_1d(y)[None, :]).argmin(axis=0)
-    result = z[ix, iy]
-    return result if np.ndim(x) or np.ndim(y) else result.item()
-
+# Relative distance kept from efficiency-map cell boundaries in max_torque_for_power.
+_EDGE_MARGIN = 1e-9
 
 RPM_TO_RAD_S = 0.10472  # 2*pi/60, matches the original scripts' scale factor
 

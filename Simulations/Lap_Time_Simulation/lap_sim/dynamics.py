@@ -541,7 +541,12 @@ def power_and_energy(
     dt = dx / vv
     tt = np.cumsum(dt)
 
-    ax = (np.roll(vv, -1) - vv) / dt
+    # Same kinematics the speed trace was built with (v_next^2 = v^2 + 2*a*dx), so this
+    # recovers exactly the acceleration force_balance allowed at each point. The plain
+    # finite difference (v_next - v) / dt comes out slightly lower, and with the
+    # nearest-neighbour efficiency map a slightly lower torque can fall into a less
+    # efficient cell and report more than the power limit.
+    ax = (np.roll(vv, -1) ** 2 - vv**2) / (2.0 * dx)
     # trace_speed_profile doesn't guarantee vv[0] and vv[-1] agree even though they're
     # the same physical point (the lap's start/finish) -- the two ends can be governed
     # by different, uncoordinated accel/brake marches. Wrapping across that gap here
