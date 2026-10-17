@@ -160,17 +160,35 @@ def corner_speed_limit(
     time_step=0.001,
     accel_tolerance=0.001 * GRAVITY,
     max_steps=100_000,
+    scan_step=2.0,
+    v_tol=1e-4,
+    v_cap=150.0,
 ):
-    """Steady-state cornering speed (m/s) for curvature `k`, found by time-marching.
+    """Steady-state speed (m/s) for curvature `k`: the lowest speed at which the net
+    acceleration a(v) from `force_balance` reaches zero, found by bracketing and
+    bisection.
 
-    `v0` seeds the search (0.0 is a cold start); passing an already-known nearby speed
-    lets this converge in a handful of steps instead of climbing all the way from a
-    stop. `max_steps` is a safety net so a non-converging case can't hang.
+    a(v) is positive at low speed and turns negative once grip (corners) or
+    power/motor torque/drag (straights) runs out; that crossing is the fastest speed
+    the car can sustain at this curvature. The search:
+      1. scans upward from 0 in `scan_step` increments until a(v) <= 0, which brackets
+         the first crossing (the same one the old time-march found starting from rest);
+      2. bisects that bracket down to `v_tol`.
+    About 30 force_balance calls per curvature. Unlike time-marching, bisection doesn't
+    need a(v) to be continuous: where a(v) jumps from positive to negative (the motor's
+    max-rpm cutoff, steps in the nearest-neighbour efficiency map) it converges onto
+    the jump instead of oscillating around it until `max_steps` runs out.
+
+    Returns the top of the bracket's a(v) > 0 side, so the result is always a speed the
+    car can sustain. A NaN from the tire model counts as "not sustainable". If a(v)
+    never turns negative below `v_cap`, returns `v_cap`.
+
+    `v0`, `time_step`, `accel_tolerance` and `max_steps` belonged to the old
+    time-marching search; they are still accepted so existing calls keep working, but
+    are ignored.
     """
-    v = v0
-    a = accel_tolerance + 1.0  # ensure at least one iteration
-    steps = 0
-    while abs(a) > accel_tolerance and steps < max_steps:
+
+    def net_accel(v):
         _, a = force_balance(
             v,
             k,
@@ -190,9 +208,29 @@ def corner_speed_limit(
             battery,
             motor=motor,
         )
-        v = v + a * time_step
-        steps += 1
-    return v
+        return a
+
+    lo = 0.0
+    if not net_accel(lo) > 0.0:
+        return 0.0
+
+    # 1. Bracket: step up until a(v) is no longer positive.
+    while True:
+        hi = min(lo + scan_step, v_cap)
+        if not net_accel(hi) > 0.0:
+            break
+        if hi >= v_cap:
+            return v_cap
+        lo = hi
+
+    # 2. Bisect: a(lo) > 0 and a(hi) <= 0 throughout.
+    while hi - lo > v_tol:
+        mid = 0.5 * (lo + hi)
+        if net_accel(mid) > 0.0:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 def _march(
