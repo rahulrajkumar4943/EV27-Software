@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lap_sim import (
     ACCEL_EVENT,
     EMRAX_208,
+    EMRAX_268,
     ENDURANCE_EVENT,
     EV27,
     FSAE_EV,
@@ -82,7 +83,7 @@ temp_ref_fn = linear_temp_schedule(
 def build_ev27() -> Car:
     """The EV26B spec specific to point_mass_sim_final.m (differs from the other
     scripts' EV26B in mass, aero, gear ratio, HV window, and motor power cap)."""
-    motor = EMRAX_208
+    motor = EMRAX_268
     return Car(
         name="EV27 Events",
         mass=200 + 60,
