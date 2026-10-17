@@ -17,6 +17,12 @@ The algorithm, in three stages:
    electrical power, plus lap-average figures.
 
 Stage 2 (`trace_speed_profile`/`_march`) is the hot loop.
+
+Power convention: `power_limit`, `battery.available_power()` and any ECMS-granted power
+are ELECTRICAL power (accumulator output). `force_balance` turns the tightest of them
+into a maximum acceleration with `max_accel_for_power`, which inverts the same chain
+`power_and_energy` uses (drivetrain efficiency, then the motor efficiency map), so the
+returned acceleration never needs more electrical power than the limit allows.
 """
 
 from __future__ import annotations
@@ -25,6 +31,34 @@ import numpy as np
 
 GRAVITY = 9.806  # m/s^2, matches the original scripts' constant
 MAX_WEIGHT_TRANSFER = 0.9  # cap on the linear load-transfer fraction below (see force_balance)
+
+
+def max_accel_for_power(v, p_elec_limit, mass, tire, ratio, count, efficiency, motor):
+    """Largest tractive acceleration (m/s^2, before drag) whose electrical draw stays
+    within `p_elec_limit` (W) at speed `v`.
+
+    Exact inverse of the chain in `power_and_energy`:
+        F -> wheel power -> / efficiency -> motor power -> / motor efficiency -> electrical
+    `Motor.max_torque_for_power` inverts the efficiency-map lookup; the power is split
+    equally across `count` motors.
+    """
+    omega = v / tire.radius * ratio
+    t_per_motor = motor.max_torque_for_power(omega, p_elec_limit / count)
+    if not np.isfinite(t_per_motor):
+        return np.inf  # standstill or no power limit: power doesn't constrain accel
+    return t_per_motor * count * ratio * efficiency / tire.radius / mass
+
+
+def wheel_to_electrical_power(f_tract, v, tire, ratio, count, efficiency, motor):
+    """Electrical power (W) drawn to deliver tractive force `f_tract` (N) at speed `v`.
+
+    Same chain as `step_battery` / `power_and_energy`. Zero when not driving (no regen).
+    """
+    if f_tract <= 0.0 or v <= 0.0:
+        return 0.0
+    omega = v / tire.radius * ratio
+    t_per_motor = f_tract * tire.radius / ratio / efficiency / count
+    return f_tract * v / efficiency / motor.efficiency(omega, t_per_motor)
 
 
 def force_balance(
@@ -46,6 +80,7 @@ def force_balance(
     battery,
     t: float = None,
     battery_power_override: float = None,
+    motor=None,
 ):
     """Longitudinal brake/accel limits (m/s^2) at speed `v` and curvature `k`.
 
@@ -53,9 +88,16 @@ def force_balance(
     acceleration by whichever of (electrical power, battery power, weight-transfer-limited
     traction, motor torque curve) is most restrictive.
 
+    `power_limit` and the battery's power are electrical. The tighter of the two is
+    converted to a maximum acceleration through the motor efficiency map, so `motor`
+    (the Motor object) is required.
+
     `battery_power_override`, when given, replaces `battery.available_power()` as the
     battery's power ceiling for this call
     """
+    if motor is None:
+        raise ValueError("force_balance needs the Motor object (motor=...)")
+
     downforce = 0.5 * air_density * cla * v * v
     fz = GRAVITY * mass + downforce
     fy = v * v * k * mass
@@ -65,14 +107,20 @@ def force_balance(
     drag = 0.5 * air_density * cda * v * v
     brake = (-potential_fx - drag) / mass
 
-    power_limited_accel = power_limit / mass / v if v > 0.0 else np.inf
+    # Electrical power ceiling (accumulator output): the power cap and, if a battery is
+    # modelled, its available (or ECMS-granted) power -- whichever is tighter.
+    p_elec_limit = power_limit
+    if battery is not None:
+        if battery_power_override is not None:
+            p_elec_limit = min(p_elec_limit, battery_power_override)
+        else:
+            p_elec_limit = min(p_elec_limit, battery.available_power())
 
-    if battery is None:
-        battery_limited_accel = np.inf
-    elif battery_power_override is not None:
-        battery_limited_accel = battery_power_override / mass / v if v > 0.0 else np.inf
-    else:
-        battery_limited_accel = battery.available_power() / mass / v if v > 0.0 else np.inf
+    # Largest acceleration whose electrical draw stays within p_elec_limit, found by
+    # inverting the motor efficiency map.
+    power_limited_accel = max_accel_for_power(
+        v, p_elec_limit, mass, tire, ratio, count, efficiency, motor
+    )
 
     # Linear load-transfer model -- only valid up to "all the load has transferred to
     # one axle" (weight_transfer -> 1). At high enough potential_fx (e.g. a lot of
@@ -88,9 +136,7 @@ def force_balance(
     max_torque = np.interp(omega, motor_w, motor_m)
     motor_limited_accel = max_torque * count * ratio * efficiency / tire.radius / mass
 
-    accel_limit = min(
-        power_limited_accel, traction_limited_accel, motor_limited_accel, battery_limited_accel
-    )
+    accel_limit = min(power_limited_accel, traction_limited_accel, motor_limited_accel)
     accel = accel_limit - drag / mass
     return brake, accel
 
@@ -142,6 +188,7 @@ def corner_speed_limit(
             motor.torque_speed_w,
             motor.torque_speed_m,
             battery,
+            motor=motor,
         )
         v = v + a * time_step
         steps += 1
@@ -171,6 +218,7 @@ def _march(
     motor_w,
     motor_m,
     battery,
+    motor,
 ):
     """Forward (accel) or backward (brake) march from `start_idx`, until the profile
     rejoins `limits_snapshot`. Returns a full-length array equal to `limits_snapshot`
@@ -203,6 +251,7 @@ def _march(
             motor_m,
             battery,
             t,
+            motor=motor,
         )
         a = accel if direction > 0 else brake
         v_sq = v * v + 2.0 * a * step
@@ -273,6 +322,7 @@ def trace_speed_profile(
                 motor.torque_speed_w,
                 motor.torque_speed_m,
                 None,
+                motor,
             )
             vv = np.minimum(vv, profile)
         elif point_limit[p] > point_limit[i]:
@@ -299,6 +349,7 @@ def trace_speed_profile(
                 motor.torque_speed_w,
                 motor.torque_speed_m,
                 None,
+                motor,
             )
             vv = np.minimum(vv, profile)
     return vv
@@ -358,7 +409,11 @@ def battery_forward_pass(
             accel_request = (vv_base[i] ** 2 - vv_base[p] ** 2) / (2.0 * dx)
             f_drag_i = 0.5 * air_density * cda * vv_base[i] ** 2
             f_tract_request = accel_request * mass + f_drag_i
-            power_request = f_tract_request * vv_base[i] if f_tract_request > 0.0 else 0.0
+            # Electrical power this point would draw (same chain as step_battery), since
+            # force_balance treats the ECMS grant as electrical power.
+            power_request = wheel_to_electrical_power(
+                f_tract_request, vv_base[i], tire, ratio, count, efficiency, motor
+            )
             i_request = power_request / battery.voltage
 
             i_ecms = ecms.command_current(
@@ -384,6 +439,7 @@ def battery_forward_pass(
             motor.torque_speed_m,
             battery,
             battery_power_override=battery_power_override,
+            motor=motor,
         )
         v_sq = vv[p] * vv[p] + 2.0 * accel * dx
         v_candidate = np.sqrt(v_sq) if v_sq > 0.0 else 0.0

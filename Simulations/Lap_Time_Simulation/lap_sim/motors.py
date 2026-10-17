@@ -7,6 +7,7 @@ the original MATLAB scripts.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import cached_property
 
 import numpy as np
 
@@ -42,6 +43,44 @@ class Motor:
         w = np.clip(omega, self.eff_speed[0], self.eff_speed[-1])
         t = np.clip(torque, self.eff_torque[0], self.eff_torque[-1])
         return _nearest_2d(self.eff_speed, self.eff_torque, self.eff_map, w, t)
+
+    @cached_property
+    def _torque_cell_edges(self) -> np.ndarray:
+        """Torque boundaries of the nearest-neighbour cells in `efficiency`.
+
+        Cell j (nearest grid torque eff_torque[j]) covers (edges[j], edges[j+1]].
+        The outer cells extend to +-inf because `efficiency` clamps torque to the map.
+        """
+        mids = 0.5 * (self.eff_torque[:-1] + self.eff_torque[1:])
+        return np.concatenate(([-np.inf], mids, [np.inf]))
+
+    def max_torque_for_power(self, omega: float, p_elec: float) -> float:
+        """Largest torque (Nm) this motor can make at speed `omega` (rad/s) while
+        drawing at most `p_elec` (W) electrically, i.e. the largest T with
+        T * omega / efficiency(omega, T) <= p_elec.
+
+        Exact inverse of the nearest-neighbour lookup in `efficiency`. At a fixed
+        speed the lookup always reads one row of the map, and along that row the
+        efficiency is constant inside each torque cell. Inside cell j electrical power
+        is T * omega / eff_j, which is linear in T, so the torque that uses exactly
+        p_elec is p_elec * eff_j / omega. Electrical power is not monotone across cells
+        (it drops wherever efficiency steps up), so scan from the highest-torque cell
+        downward and return the first torque that actually lies inside its cell.
+
+        Does not apply the torque-speed envelope; take the min with `max_torque`.
+        """
+        if omega <= 0.0 or not np.isfinite(p_elec):
+            return np.inf  # power doesn't constrain torque at standstill
+        if p_elec <= 0.0:
+            return 0.0
+        w = min(max(omega, self.eff_speed[0]), self.eff_speed[-1])
+        row = self.eff_map[np.abs(self.eff_speed - w).argmin()]
+        edges = self._torque_cell_edges
+        for j in range(row.shape[0] - 1, -1, -1):
+            t = min(edges[j + 1], p_elec * row[j] / omega)
+            if t > edges[j]:
+                return t
+        return 0.0  # unreachable: the lowest cell extends to -inf
 
     def with_power_limit(self, hard_power_limit: float) -> "Motor":
         return replace(self, hard_power_limit=hard_power_limit)
